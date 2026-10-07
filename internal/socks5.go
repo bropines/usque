@@ -296,6 +296,44 @@ func (s *SOCKS5Server) dialUDP(network, laddr, raddr string) (net.Conn, error) {
 	return rc, nil
 }
 
+// udpHostKey is the AssociatedUDP key used when a client could not name the
+// address its datagrams will come from. Keying on the host alone accepts any
+// source port from that host, and nothing from any other host.
+func udpHostKey(ip net.IP) string {
+	return "host|" + ip.String()
+}
+
+// udpAssociationKeys returns the AssociatedUDP keys a UDP ASSOCIATE should be
+// registered under.
+//
+// A client that does not yet know which local address its datagrams will come
+// from sends an all-zero DST.PORT in the ASSOCIATE request; a socket normally
+// has no source port until it is first used. socks5.Request.UDP then
+// substitutes the address of the TCP control connection, which carries the
+// right host but the TCP source port. The key therefore never matches the port
+// the datagrams actually arrive from, UDPHandle rejects every one of them, and
+// UDP silently never works for such a client. xray-core's SOCKS outbound is
+// one of them.
+//
+// For that case we additionally register a host-only key. The check stays
+// meaningful: datagrams from the host that opened the control connection are
+// accepted on any port, and datagrams from any other host are still rejected.
+func udpAssociationKeys(r *socks5.Request, caddr net.Addr, tcpRemote net.Addr) []string {
+	keys := []string{caddr.String()}
+	if len(r.DstPort) != 2 || r.DstPort[0] != 0 || r.DstPort[1] != 0 {
+		return keys
+	}
+	host, _, err := net.SplitHostPort(tcpRemote.String())
+	if err != nil {
+		return keys
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return keys
+	}
+	return append(keys, udpHostKey(ip))
+}
+
 func (s *SOCKS5Server) TCPHandle(srv *socks5.Server, c *net.TCPConn, r *socks5.Request) error {
 	switch r.Cmd {
 	case socks5.CmdConnect:
@@ -314,8 +352,15 @@ func (s *SOCKS5Server) TCPHandle(srv *socks5.Server, c *net.TCPConn, r *socks5.R
 		}
 		ch := make(chan byte)
 		defer close(ch)
-		srv.AssociatedUDP.Set(caddr.String(), ch, -1)
-		defer srv.AssociatedUDP.Delete(caddr.String())
+		keys := udpAssociationKeys(r, caddr, c.RemoteAddr())
+		for _, k := range keys {
+			srv.AssociatedUDP.Set(k, ch, -1)
+		}
+		defer func() {
+			for _, k := range keys {
+				srv.AssociatedUDP.Delete(k)
+			}
+		}()
 		_, _ = io.Copy(io.Discard, c)
 		return nil
 	}
@@ -366,6 +411,11 @@ func (s *SOCKS5Server) UDPHandle(srv *socks5.Server, addr *net.UDPAddr, d *socks
 	var ch chan byte
 	if srv.LimitUDP {
 		any, ok := srv.AssociatedUDP.Get(src)
+		if !ok {
+			// The client may not have been able to name its source port at
+			// ASSOCIATE time; fall back to the host-only association.
+			any, ok = srv.AssociatedUDP.Get(udpHostKey(addr.IP))
+		}
 		if !ok {
 			return fmt.Errorf("udp address %s is not associated with tcp", src)
 		}
